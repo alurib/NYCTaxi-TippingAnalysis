@@ -1,0 +1,536 @@
+---
+title: "NYC Taxi Riders' Tipping Behavior Analysis"
+author: "Bharat Aluri"
+date: "12/6/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1.Introduction
+
+In this project, we would like to study the data of NYC Green Taxis focusing on the tipping habits of the riders. It is also an indication of whether the rider's satisfied/dissatisfied with the ride.
+
+In 2013, the TLC (Taxi Limousine Commission), under then mayor Bloomberg, laid out a new program introducing a new taxi system painted 'apple green' on their exteriors. They are the second class citizens in the world of NYC taxis in that they cannot compete with the yellow taxis within the protected 'yellow zone' (below E 96th street and W 110th street). They are only allowed to pick up passengers outside of this “yellow zone”. Green taxis serve New York city by going to places the yellow taxis drivers prefer not to go.
+
+The goal of this study is to predict the tip target variables based on trip information such as pickup and drop of locations, time of the day, fare, distance and number of passengers. We use the Green Taxi trip data for the month of September 2015 for NYC, which has around 1.5 Million rows. The data is obtained from [NYC Taxi and Limousine Commission](http://www.nyc.gov/html/tlc/html/about/trip_record_data.shtml). To look at the data dictionary for the data, [click here](http://www.nyc.gov/html/tlc/downloads/pdf/data_dictionary_trip_records_green.pdf). There are few things that needs to be noted about the data, the data for year 2015 which we use has the dropoff/pickup_lat/long whereas, the trips data for year 2017 has pickup location id and dropoff location id.
+
+For this study, We will first clean the original data, engineer new features, examine potential outliers  and visualize the data. Finally, we will make a brief excursion into viewing this as a classification problem and finish the report with randomforest classification model and the regression models for predicting the tip variables.
+
+And finally, the models are only a basic sarting point and can be improved and optimised for better performance. Other complex models can also be used to further improve the accuracy and prediction.
+
+Let's get started
+
+## 1.1 Load Libraries
+
+We load the libraries we will use in the study.
+```{r, message = FALSE, warning=FALSE}
+library(tidyverse)
+library(stringr)
+library(lubridate)
+library(corrplot)
+library(geojson)
+library(geojsonio)
+library(leaflet)
+library(leaflet.extras)
+library(gmodels)
+library(randomForest)
+library(caret)
+library(pROC)
+library(sp)
+```
+
+## 1.2 Load Data
+
+We download the data from the NYC taxi commision website directly through commands and load them into our workspace.
+
+```{r, message=FALSE, warning=FALSE}
+## Downloading the data to working directory
+
+## URL for the data
+URL_G <- "https://s3.amazonaws.com/nyc-tlc/trip+data/green_tripdata_2017-04.csv"
+
+## URL for the data dictionary
+datadictionary_G <-"http://www.nyc.gov/html/tlc/downloads/pdf/data_dictionary_trip_records_green.pdf"
+
+#downloading the file
+download.file(URL_G, destfile = basename(URL_G))
+
+download.file(datadictionary_G,destfile = basename(datadictionary_G)) 
+#Data Dictionary for the Green Taxi Data.
+
+Green <- read_csv("green_tripdata_2015-09.csv")
+
+```
+
+## 1.3 File Structure and Content
+
+We look at the summary of the dataset to get quick idea about variables.
+```{r, echo = FALSE}
+summary(Green)
+```
+
+We also look at the structure of the dataset and the variables.
+```{r, echo = FALSE}
+glimpse(Green)
+```
+
+There are few observations that needs to be made here namely,
+- VendorID, RatecodeID, store_and_fwd_flag, payment_type, trip_type variables are classified as character and integers. They need to coded as factor variables.
+- New features such as hour, day of the week needs to be exctracted out of the pickup/dropoff_datetime variables for further analysis.
+
+
+```{r, echo = FALSE}
+green_taxi <- Green
+green_taxi <- green_taxi %>% 
+  select(-c(Ehail_fee)) %>% 
+  mutate(VendorID= factor(VendorID),
+         RateCodeID= factor(RateCodeID),
+         Store_and_fwd_flag = factor(Store_and_fwd_flag),
+         Payment_type = factor(Payment_type),
+         Trip_type= factor(Trip_type))
+         
+```
+
+
+## 1.4 Missing Data
+
+There are 4 missing values for the "trip_type" variable and 6 observations have "99" for RateCodeID which generally indicates missing values. Other than that, the data has no missing values. But the data is very dirty, which needs a lot of cleaning later.
+
+# 2. Data Cleaning
+
+Apart from the missing values as stated above, a few sources of dirtiness in the data are as follows - 
+
+- Unrealistic durations (We extract duration from pickup and dropoff time.)
+- Negative fares or zero trip distance
+- Wrong GPS coordinates (Zero lat/long)
+- Other
+
+For the negative fare amounts, we substitute them with their absolute values since, which might be due to untrained human input error, GPS instrument error, etc.. We extract duration in minutes for the trip from the pickup and dropoff times. We also create a speed variable using duration and trip_distance.
+
+**Data Filtering**
+
+And for filtering the data, we consider the following steps:
+
+1. We ignore the trips with duration of less than a half a minute or greater than 1 hrs. (To ignore trips with that took longer than 3 hrs and also trips that were timed accidently or any other reason. Taxi hire for duration that short are unrealistic anyway.)
+2. We remove trips with zero distances or greater than 50 miles. (We restrict ourselves to short distance trips)
+3. We ignore trips with pickup/drop_lat/long fo zero values. (This would mean missing lat/long values.)
+4. Remove the observations with NA's(or 99) for RateCodeID and Trip_type.
+5. Remove fare amounts less than USD 2.5 (Minimum fare).
+6. **We finally restrict ourselves to trips that has credit card as the mode of payment because, the tips data is recorded for just credit card tips and the data for cash tips are not included in the dataset.** This can be proved by looking at the sum of the tips for trip with cash as mode of payment vs credit card. The sum of tips for about 800K trips with cash as mode of payment is USD 163 whereas, the sum of tips for 700K trips with credit card as mode of payment is around USD 2 Million.
+
+**Column Selection**
+
+We also remove the following redundant columns:
+
+1. improvement_surcharge, MTA_tax, Extra (These variables have almost same values for most of the trips and would just increase noise.)
+2. Total_amount (We already have the Fare_amount and having this variable is unneccesary.)
+3. Payment_type
+
+Doing all this brings down the number of observations by more than half. We now have data for around 600K trips.
+```{r, echo = FALSE}
+green_taxi <- green_taxi %>% 
+  mutate(Fare_amount= abs(Fare_amount),
+         Extra = abs(Extra),
+         MTA_tax = abs(MTA_tax),
+         Tip_amount = abs(Tip_amount),
+         Tolls_amount= abs(Tolls_amount),
+         improvement_surcharge = abs(improvement_surcharge),
+         Total_amount = abs(Total_amount),
+         Duration=as.numeric(as.duration(lpep_pickup_datetime %--% Lpep_dropoff_datetime),"minutes"),
+         Speed=(Trip_distance/Duration) *60
+         ) 
+
+green_taxi <- green_taxi %>% 
+  filter(Duration >= 0.5, Duration <= 60,
+         Trip_distance > 0, Trip_distance <=50,
+         Pickup_latitude !=0,Pickup_longitude !=0,
+         Dropoff_latitude !=0, Dropoff_longitude !=0,
+         !is.na(Trip_type),
+         RateCodeID != "99",
+         Fare_amount >= 2.5,
+         Payment_type == 1
+         )
+
+green_taxi <- green_taxi %>% 
+  select(-c(MTA_tax,improvement_surcharge,Total_amount,Extra, Payment_type))
+  
+```
+
+
+# 3. Feature Engineering
+
+In this section we build new features from the existing data such as the target variable itself and also new potential predictors for the target variable. 
+
+We extract the borough of the pickups and dropoffs using a geojson polygon file of New York City. We restrict the boroughs to one the following five:
+1. Manhattan
+2. Bronx
+3. Brooklyn
+4. Queens
+5. Manhattan
+
+The geojson file can be obtained form this link [here](https://github.com/arelenglish/borough_boundries).
+
+We can extract the neighborhoods for the pickups and dropoff too but, that would have a total number of around 300 and getting computational resources to use that variable becomes difficult. So we limit ourselves to the boroughs.
+
+We also extract the hour of the day and the day of the week for the pickups. These variable might lead us to some useful insights on tipping habits of riders. We create a "Tip_percent" variable which gives us the tip in terms of percentage of fare amount.
+
+```{r, echo = FALSE}
+
+# Loading the NYC geojson polygon file
+nyc<-geojson_read('borough_boundries_shoreline.geojson',what='sp')
+Boroughs = c('Manhattan', 'Bronx', 'Brooklyn', 'Queens', 'Staten Island') #BoroughCode Mapping
+
+nyc2<-nyc
+nyc2@data[,-c(2)]<-NULL #only keep the borough code, throw away the others
+
+PickupPts<-SpatialPoints(cbind(green_taxi$Pickup_longitude,green_taxi$Pickup_latitude))
+
+PickupPts@proj4string <- nyc@proj4string
+pickupBoroughCodes<-PickupPts %over% nyc2
+rm(PickupPts)
+green_taxi$boroughCode_p <- pickupBoroughCodes$BoroCode
+rm(pickupBoroughCodes)
+
+DropoffPts<-SpatialPoints(cbind(green_taxi$Dropoff_longitude,green_taxi$Dropoff_latitude))
+DropoffPts@proj4string <- nyc@proj4string
+dropoffBoroughCodes<-DropoffPts %over% nyc2
+rm(DropoffPts)
+green_taxi$boroughCode_d <- dropoffBoroughCodes$BoroCode
+rm(dropoffBoroughCodes)
+
+## Extracting the hour and the day of the week of the pickup.
+green_taxi$wday  <- wday(green_taxi$lpep_pickup_datetime, abbr = TRUE, label= TRUE)
+green_taxi$hour  <- hour(green_taxi$lpep_pickup_datetime)
+
+## Calculating the Tip Percent of the Fare amount
+green_taxi$TipPercent  <- (green_taxi$Tip_amount/green_taxi$Fare_amount) * 100.0
+
+# Creating new variable "Tipped" to take on 1 if tipped, 0 if not.
+green_taxi$Tipped <- ifelse(green_taxi$Tip_amount==0,0,1)
+
+```
+
+## 3.1 Final Cleaning
+
+Finally, we limit
+
+1. Speed variable in the data to 100 (average speed greater than 100 is unrealistic)
+2. TipPercent to 100% (It is rare when someone tips higher than the fare amount)
+3. Remove the observations which do not fall into either of the 5 bouroughs.
+
+```{r, echo = FALSE}
+Boroughs = c('Manhattan', 'Bronx', 'Brooklyn', 'Queens', 'Staten Island') #BoroughCode Mapping
+
+green_taxi <- green_taxi %>% 
+  filter(Speed<100,
+         TipPercent<100,
+         !is.na(boroughCode_d),
+         !is.na(boroughCode_p)) %>% 
+  mutate(Tipped= factor(Tipped),
+         boroughCode_p = factor(boroughCode_p, labels = Boroughs),
+         boroughCode_d = factor(boroughCode_d, labels = Boroughs))
+```
+
+**We see that about 90K trips out of around 700K trips are not tipped which makes it to around 14% of the trips.**
+
+# 4. Feature Visualizations
+
+## 4.1 Pickup and Dropoff Locations
+
+We use leaflet package to plot the visualization below. We look the pickup and dropoff locations for the trips for random sample of 8000. This should give us a fair idea of which place the green taxis are ridden to or ridden from.
+
+```{r, echo = FALSE}
+set.seed(1234)
+foo <- sample_n(green_taxi, 8e3)
+
+leaflet(data = foo) %>% addProviderTiles("Esri.NatGeoWorldMap") %>%
+  addCircleMarkers(~ Pickup_longitude, ~Pickup_latitude, radius = 1,
+                   color = "blue", fillOpacity = 0.3)
+
+```
+
+```{r, echo = FALSE}
+leaflet(data = foo) %>% addProviderTiles("Esri.NatGeoWorldMap") %>%
+  addCircleMarkers(~ Dropoff_longitude, ~Dropoff_latitude, radius = 1,
+                   color = "blue", fillOpacity = 0.3)
+```
+
+1. We confirm that the pickups are restricted in manhattan area.
+2. We see that the pickups are closely located whereas the droppoff locations vary widely across the boroughs.
+
+## 4.2 Tip Percent w.r.t Duration
+
+We look at the plot for Tip percent by duration. We also look at the number of trip in these duration range.
+```{r, echo = FALSE}
+by_Duration<-green_taxi %>%
+  filter(TipPercent<50) %>% 
+  group_by(Duration=floor(Duration)) %>% 
+  summarise(Speed = mean(Speed),TipPercent=mean(TipPercent),dist=mean(Trip_distance),count=n())
+
+
+ggplot(by_Duration, aes(x=(Duration), y=TipPercent)) +
+  geom_point(aes(color=count),size=2,shape=1) +
+  scale_x_continuous(name='Duration in Minutes',breaks=seq(0,60,by=5))+geom_smooth(se=F) +
+  ylab('Tip Percentage')+
+  ggtitle('The green taxi Tip Percent by duration')
+```
+1. We see that the higher tip percents are payed for trips with lower durations and it decreases with increase in duration.
+2. Most of the trip have durations less than 15 minutes. This might be because people prefer taxis for shorter rides and prefer other means of transport for longer rides.
+3. It is also interesting to see that since trips with lower duration time also have lower fares, even if people pay a dollar or two more the Tip Percent is likely to go on the higher side. And riders with longer trip need to cash out more money to achieve higher tip percent.
+
+## 4.3 TipPercent by hour of the day and day of the week
+
+We now plot a heatmap showing the contrast in tip percentages by hour of the day and the day of the week.
+
+```{r, echo = FALSE}
+
+by_wdayNhour<-green_taxi %>%
+  group_by(wday,hour) %>%
+  summarise(Speed=mean(Speed),Duration=mean(Duration),
+            dist=mean(Trip_distance),TipPercent=mean(TipPercent),count=n()) 
+
+
+ggplot(filter(by_wdayNhour), aes(x=wday, y=as.factor(hour),fill=TipPercent)) +
+  geom_tile() +
+  scale_fill_gradientn(colors=c('black','dark red','red','orange','yellow','white')) +
+  scale_x_discrete(name='week day')+
+  ggtitle('The green taxi Tip Percent in a weekday vs hour heat map') +
+  ylab('hour') +
+  labs(fill="Avg Tip Percent")
+
+```
+
+We find:
+
+1. The Tip percent are higher during the evenings on weekdays compared to the weekends. The time during which drivers get paid more tip in term of percent of fare amount is 5pm - 12am.
+2. We see that the Tip percent after midnight on weekends is higher compared to the weekdays. This might be because people go home late in the weekends when they leave the late night parties or whatever.
+3. The worst tip percent is during early morning between 5-8am and mostly during the weekends. 
+
+## 4.4 Tip Percent w.r.t Speed
+
+We now plot Tip Percent to speed to see how the average speed and tip percents are related. We also plot the number of trips that happen for those speeds and tip percent values.
+
+```{r, echo = FALSE}
+by_speed<-green_taxi %>%
+  filter(Speed<50,TipPercent<50) %>% 
+  group_by(Speed=floor(2*Speed)/2) %>% 
+  summarise(Duration=mean(Duration),TipPercent=mean(TipPercent),dist=mean(Trip_distance),count=n())
+
+
+ggplot(by_speed, aes(x=(Speed), y=TipPercent)) +
+  geom_point(aes(color=count),size=2,shape=1) +
+  scale_x_continuous(name='speed (mph)',breaks=seq(0,50,by=5))+geom_smooth(se=F) +
+  ylab('tip percentage')+
+  ggtitle('The green taxi Tip Percent by speed')
+
+
+
+```
+
+1. It is interesting to see that higher tip percentages are related to average speeds between 10-15mph.
+2. We can see that most of the trips have an average speed of again 10-15mph. This can be due to the fact that most of the trips are within the city and in the busiest areas which have speed restrictions and comparitively heavy traffic.
+
+
+
+## 4.5 Tip Percent based on Borough 
+
+Here we look at the mean average tip percent by the bouroughs. We remove the trips for "Staten Island" because of the small number of trips made to and fro the borough.
+
+```{r, echo = FALSE}
+
+by_pickupNdropoff<-green_taxi %>%
+  filter(boroughCode_p!="Staten Island",boroughCode_d!="Staten Island") %>% 
+  group_by(boroughCode_p,boroughCode_d) %>%
+  summarise(Speed=mean(Speed),Duration=mean(Duration),
+            dist=mean(Trip_distance),TipPercent=mean(TipPercent),count=n()) 
+
+
+ggplot(filter(by_pickupNdropoff), aes(x=boroughCode_p, y=boroughCode_d,fill=TipPercent)) +
+  geom_tile() +
+  scale_fill_gradientn(colors=c('black','dark red','red','orange','yellow','white')) +
+  scale_x_discrete(name='Pickup Borough')+
+  ggtitle('The green taxi Tip Percent in bouroughs heat map') +
+  ylab('Dropoff Borough') +
+  labs(fill="Avg Tip Percent")
+
+```
+
+1. It is intersting to see that the taxi drivers are payed the lowest Tip Percent when  a trip is made within Bronx. And also comparitively the riders who get down at Bronx pay the lowest Tip Percent.
+2. People who travel to or from Queens seem to pay more tip percent in general compared to all the other boroughs. And specifically people who ride from manhattan pay the highest tip percent. Brooklyn might be the best place to get higher tip percents.
+3.Even though the tip percents from riders who get down in brooklyn aren't great. People who travel withing Brooklyn tend to pay the highest tip percent.
+4. It will be intersting to research more about who these people might be or thier occupations might be. Having this information would help taxi drivers get the right customer.
+
+
+# 5. Correlation Overview
+
+After engineering new features and before starting the modelling, we will visualise the relations between our numeric parameters using a correlation matrix. We could hence change all our features to numeric to create a correlation plot but, that wouldn't make sense. The visualisation uses the corrplot function from the corrplot package. Corrplot gives us great flexibility in manipulating the style of our plot.
+
+What we see below, are the colour-coded correlation coefficients for each combination of two features. In simplest terms: this shows whether two features are connected so that one changes with a predictable trend if you change the other. The closer this coefficient is to zero the weaker is the correlation. Both 1 and -1 are the ideal cases of perfect correlation and anti-correlation (dark blue and dark red in the plots below).
+
+```{r, echo = FALSE}
+mycorr <- cor(green_taxi[,c(10,11,12,13,14,16,17,21,22)])
+corrplot(mycorr, order = "hclust")
+```
+
+We find:
+
+1. Fare amount and trip distance has significant correlation with tip amount which we are interested in and followed by duration and tip percent. This signifies that with increase in trip distance and fare amount the tip amout increases. So it is interesteing to see that longer trips are associated with higher trip amount.
+
+2. It is interesting to see that the speed and the number of passengers have little to no correlation with tip amount. One reason for lower correlation between number of passengers and tip amount might be the mix of data. The data seems o be dominated with trips with one or two passengers. It will be interesting to see how the correlation turns out to be if the mix of trip with number of passengers is even.
+
+
+# 6. Models and Predictions
+
+In the final step we will feed our exploratory and engineering insights into simple models to predict the target "Tipped" and "TipPercent" for a test data set. The test data will be 1/6th of the original data set.
+
+## 6.1 Preparations
+
+### 6.1.1 Test vs Train Overlap
+
+Lets create a test and a training data set out of the original data. Test dataset will be 1/6th of the original dataset.
+
+```{r, echo = FALSE}
+set.seed(12)
+
+j <- nrow(green_taxi)
+
+sept15 <- green_taxi %>% 
+  filter(mday(lpep_pickup_datetime)==15)
+k <- nrow(sept15)
+
+taxi_rand <- green_taxi[order(runif(j)), ]
+taxi_train <- taxi_rand[1:((5*j)/6), ]
+taxi_test  <- taxi_rand[(((5*j)/6)+1):j, ]
+
+sept15_rand <- sept15[order(runif(k)), ]
+sept15_train <- sept15_rand[1:((5*k)/6), ]
+sept15_test  <- sept15_rand[(((5*k)/6)+1):k, ]
+
+taxi_train$dset <- "train"
+taxi_test$dset <- "test"
+
+combine <- rbind(taxi_test,taxi_train)
+
+```
+
+In order to make sure that we are really training on features that are relevant to our test data set we will now briefly compare the temporal and spatial properties of the train and test data. This is another consistency check. Here are two relavent comparision plots.
+
+```{r, echo = FALSE}
+foo <- combine %>%
+  mutate(date = date(lpep_pickup_datetime)) %>% 
+  group_by(date, dset) %>%
+  filter(month(date)==9) %>% 
+  count()
+           
+foo %>%
+  ggplot(aes(date, n, color = dset, group = dset)) +
+  geom_line(size = 1.5) +
+  labs(x = "", y = "Kilo trips per Day")
+```
+
+
+```{r, echo = FALSE}
+pick_good <- combine 
+pick_good <- sample_n(pick_good, 5e3)
+
+pick_good %>%
+  ggplot(aes(Pickup_longitude, Pickup_latitude, color = dset)) +
+  geom_point(size=.5, alpha = 0.5) +
+  coord_cartesian() +
+  facet_wrap(~ dset) +
+  #guides(color = guide_legend(override.aes = list(alpha = 1, size = 4))) +
+  theme(legend.position = "none")
+```
+
+We find that our train and test data sets do indeed cover the same time range and geographical area.
+
+### 6.1.2 Feature Selection
+
+Not all features in our data set will be useful. Here we only include meaningful variables and remove for instance pickup/dropoff_times, pickup/drop_lat/long, Tip_amount and TipPercent.
+
+In principle, we could include all features and leave the selection of the useful ones to our modelling algorithm. However, in our case a pre-selection could be useful because we have engineered few features from existing ones (such as boroughCode_d,boroughCode_p, hour, wday). This strategy can cause significant collinearity within our training feature set, which will make it more difficult to interpret the result of our model in terms of the impact of individual features. 
+
+```{r, echo = FALSE}
+taxi_test <- taxi_test[,-c(2,3,6,7,8,9,13,22,24)]
+taxi_train <- taxi_train[,-c(2,3,6,7,8,9,13,22,24)]
+
+sept15_test <- sept15_test[,-c(2,3,6,7,8,9,13,23)]
+sept15_train <- sept15_train[,-c(2,3,6,7,8,9,13,23)]
+```
+
+## 6.2 Random Forest for Classification Problem
+
+We use Random forest as our model to predict whether a trip will be tipped or not using the "Tipped" variable. Random forest has less variance compared to bagging and decision trees. Random forest also solves the problem of correlation between variables by decorrelating the trees by choosing a particular number of variables at each node of a tree, while bagging suffers with the problem of correltion.
+
+We will look at the Out-of-Bag error for random forests. We will use 30 trees due to limites computational power. Finally, we try to predict the test data set with the model to see how the model finally performs.
+
+```{r, echo = FALSE}
+m <- randomForest(taxi_train[,-c(15)], taxi_train$Tipped, ntree = 30)
+## taking out the TipPercent variable as well since included that in the dataset for
+## regression problem later.
+
+varImpPlot(m)
+```
+
+
+We now look at the OOB Confusion matrix
+```{r, echo = FALSE}
+print(m)
+```
+
+
+```{r, echo = FALSE}
+prf1 <- predict(m, taxi_test[,-c(15)], type = "response")
+
+CrossTable(taxi_test$Tipped, prf1,
+           prop.chisq = FALSE, prop.c = FALSE, prop.r = FALSE,
+           dnn = c('Actual Tipped', 'Predicted Tipped'))
+
+```
+We achieve an out-of-bag accuracy of 86.5% but , with class error rates of 96.5% for "Not tipped" and 0.5% for "tipped".
+
+
+```{r, echo = FALSE}
+prf <- predict(m, taxi_test[,-c(15)], type = "prob")
+
+RC <- roc(taxi_test$Tipped,prf[,2])
+plot(RC, print.thres="best", print.thres.best.method="closest.topleft")
+
+result.coords <- coords(RC, "best", best.method="closest.topleft", ret=c("threshold", "accuracy"))
+print(result.coords)#to get threshold and accuracy
+```
+
+## 6.3 Random Forests for Regression Problem
+
+We now perform Random Forest Regression but on a dataset much smaller due to time taken to run regression random forest on the original dataset. We choose the day Sept 15 which has around 19K trips. Sowe now see what variables are important in predicting the TipPercent. It should be interesting to see how the variable importance differs from the classification problem. We choose to use 50 trees for this function.
+
+```{r, echo = FALSE}
+r <- randomForest(sept15_train[,-c(15)], sept15_train$TipPercent, ntree = 50)
+
+varImpPlot(r)
+```
+
+The MSE tends to almost constant after 45 trees. We see that using the "do.trace" arguement in the function above. 
+
+```{r, echo = FALSE}
+print(r)
+```
+
+The MSE is prety high and doesn't seem to have done a good job. The negative variance stands by that statement. There must be some piece I must be missing. Anyway, there is lot of room for improvement and this can be researched further on how to decrease the MSE more to accurately predict the tip in terms of percentage of fare amount.
+
+# 7. Recommendations/ Conclusions
+
+There are many recommendations that can be made to take this study further. Some of them are as follows:
+
+1. We can use extend our analysis by introducing external data such as the weather data which can further talk about how the changes in weather changes the riders tipping behavior. This data can be exctracted from National Weather Service Forecast Office [website](http://w2.weather.gov/climate/xmacis.php?wfo=okx). It would be interesting to look if rainy days and snowy days changes how the rider tips.
+
+2. Due to computational limitations, we didn't have a chance to use the neighborhood data of pickups and dropoffs. There were around 300 neighborhood categories for the data we have and it is just not plausible to use a variable with 300 categories. So, instead we just used the boroughs. I believe using neighborhoods would be a great way to how the tipping behavior changes across neighborhoods or see which areas gets the most tips. The shapefile for the neighborhood can be found at [Zillow](https://www.zillow.com/howto/api/neighborhood-boundaries.htm).
+
+3. Instead of looking at whether a ride results in a tip or not, it would be more interesting to look at how these variables affect the tip in terms of percentage of fare amount. We could use regression models instead of classification models to achieve the same. It would be more helpful and meaningful to regular taxi driver to know which places or time gets more tip than knowing plainly whether a trip gets you a tip or not.
+
+4. We can compare the tipping behaviors of the riders for the yellow taxis and the green taxis. We can even introduce Uber and Lyft data to differentiate between the services.
+
+5. Finally, due to computational limitations, we had to limit our data to a month for exploratory data analysis and to a day for modelling and prediction. It would be more accurate if we can look at the data for an year or more, where the season or months might be a potential predictor for answering the question.
